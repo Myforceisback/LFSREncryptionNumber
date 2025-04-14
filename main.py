@@ -1,3 +1,4 @@
+https://disk.yandex.ru/d/qv_uxhMuTPMgpA
 import numpy as np
 import math
 from pylfsr import LFSR
