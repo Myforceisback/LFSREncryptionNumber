@@ -1,8 +1,9 @@
-#include <iostream>
+include <iostream>
 #include <vector>
 #include <fstream>
 #include <type_traits>
 #include <string>
+#include <utility>
 #include <variant>
 #include <cstring>
 #include <cstddef>
@@ -17,280 +18,286 @@ enum class TypeId : Id {
     Vector
 };
 
-namespace detail {
-    
-    class Any;
+class Any;
 
-    template<typename T>
-    constexpr TypeId type_to_id() {
-        if constexpr (std::is_same_v<T, uint64_t>) return TypeId::Uint;
-        else if constexpr (std::is_same_v<T, double>) return TypeId::Float;
-        else if constexpr (std::is_same_v<T, std::string>) return TypeId::String;
-        else return TypeId::Vector;
-    }
+// ID из Type
+template<class T>
+constexpr TypeId typeToId() {
+    if constexpr (std::is_same_v<T, uint64_t>)
+        return TypeId::Uint;
+    else if constexpr (std::is_same_v<T, double>)
+        return TypeId::Float;
+    else if constexpr (std::is_same_v<T, std::string>)
+        return TypeId::String;
+    else 
+        return TypeId::Vector;
+}
 
-    template<TypeId Id>
-    struct id_to_type;
+//Type из ID
+template<TypeId id>
+struct idToType;
+template<> struct idToType<TypeId::Uint>    { using type = uint64_t;         };
+template<> struct idToType<TypeId::Float>   { using type = double;           };
+template<> struct idToType<TypeId::String>  { using type = std::string;      };
+template<> struct idToType<TypeId::Vector>  { using type = std::vector<Any>; };
 
-    template<> struct id_to_type<TypeId::Uint> { using type = uint64_t; };
-    template<> struct id_to_type<TypeId::Float> { using type = double; };
-    template<> struct id_to_type<TypeId::String> { using type = std::string; };
-    template<> struct id_to_type<TypeId::Vector> { using type = std::vector<Any>; };
-
-    template<typename T>
-    void serialize_value(const T& value, Buffer& buffer) {
-        const auto* ptr = reinterpret_cast<const std::byte*>(&value);
-        buffer.insert(buffer.end(), ptr, ptr + sizeof(T));
-    }
-
-    template<>
-    void serialize_value<std::string>(const std::string& value, Buffer& buffer) {
-        uint64_t size = value.size();
-        serialize_value(size, buffer);
-        const auto* ptr = reinterpret_cast<const std::byte*>(value.data());
-        buffer.insert(buffer.end(), ptr, ptr + value.size());
-    }
-
-    template<>
-    void serialize_value<std::vector<Any>>(const std::vector<Any>& value, Buffer& buffer) {
-        uint64_t size = value.size();
-        serialize_value(size, buffer);
-        for (const auto& item : value) {
-            item.serialize(buffer);
+// Сериализация типов
+namespace basicSerialization {
+    template<class T>
+    void serialize_type(const T& type, Buffer& buffer) {
+        // Сериализация базовых типов ( TypyId::Uint, TypyId::Float )
+        if constexpr (std::is_same_v<T, uint64_t> || std::is_same_v<T, double>) {
+            const auto* ptr = reinterpret_cast<const std::byte*>(&type);
+            buffer.insert(buffer.end(), ptr, ptr + sizeof(T));
+        }
+        // Сериализация std::string ( TypyId::String )
+        else if constexpr (std::is_same_v<T, std::string>) {
+            uint64_t size = type.size();
+            serialize_type(size, buffer);
+            const auto* ptr = reinterpret_cast<const std::byte*>(type.data());
+            buffer.insert(buffer.end(), ptr, ptr + type.size());
+        }
+        // Сериализация std::vector<Any> ( TypyId::Vector )
+        else if constexpr (std::is_same_v<T, std::vector<Any>>) {
+            uint64_t size = type.size();
+            serialize_type(size, buffer);
+            for (const auto& Ttype : type)
+                Ttype.serialize(buffer);
         }
     }
-
-    template<typename T>
-    Buffer::const_iterator deserialize_value(Buffer::const_iterator begin, Buffer::const_iterator end, T& value) {
-        if (std::distance(begin, end) < static_cast<std::ptrdiff_t>(sizeof(T))) {
-            throw std::runtime_error("Invalid buffer size");
+}
+// Десериализация типов
+namespace basicDeSerialization { 
+    template<class T>
+    Buffer::const_iterator deserialize_type(Buffer::const_iterator begin, Buffer::const_iterator end, T& type) {
+        // Десериализация базовых типов ( TypyId::Uint, TypyId::Float )
+        if constexpr (std::is_same_v<T, uint64_t> || std::is_same_v<T, double>) {
+            if (std::distance(begin, end) < static_cast<std::ptrdiff_t>(sizeof(T))) {
+                throw std::runtime_error("Invalid buffer size");
+            }
+            std::memcpy(&type, &*begin, sizeof(T));
+            return begin + sizeof(T);
         }
-        std::memcpy(&value, &*begin, sizeof(T));
-        return begin + sizeof(T);
-    }
-
-    template<>
-    Buffer::const_iterator deserialize_value<std::string>(Buffer::const_iterator begin, Buffer::const_iterator end, std::string& value) {
-        uint64_t size = 0;
-        begin = deserialize_value(begin, end, size);
-        if (std::distance(begin, end) < static_cast<std::ptrdiff_t>(size)) {
-            throw std::runtime_error("Invalid buffer size");
+        // Десериализация std::string ( TypyId::String )
+        else if constexpr (std::is_same_v<T, std::string>) {
+            uint64_t size = 0;
+            begin = deserialize_type(begin, end, size);
+            if (std::distance(begin, end) < static_cast<std::ptrdiff_t>(size)) {
+                throw std::runtime_error("Invalid buffer size");
+            }
+            type.assign(reinterpret_cast<const char*>(&*begin), size);
+            return begin + size;
         }
-        value.assign(reinterpret_cast<const char*>(&*begin), size);
-        return begin + size;
-    }
-
-    template<>
-    Buffer::const_iterator deserialize_value<std::vector<Any>>(Buffer::const_iterator begin, Buffer::const_iterator end, std::vector<Any>& value) {
-        uint64_t size = 0;
-        begin = deserialize_value(begin, end, size);
-        value.resize(size);
-        for (auto& item : value) {
-            begin = item.deserialize(begin, end);
+        // Десериализация std::vector<Any> ( TypyId::Vector )
+        else if constexpr (std::is_same_v<T, std::vector<Any>>) {
+            uint64_t size = 0;
+            begin = deserialize_type(begin, end, size);
+            type.resize(size);
+            for (auto& Ttype : type) {
+                begin = Ttype.deserialize(begin, end);
+            }
+            return begin;
         }
-        return begin;
     }
 }
 
-template<typename T>
-class TypeWrapper {
+//Базовый тип TType
+template<class T>
+class Wrapper {
 public:
-    using value_type = T;
-
-    template<typename U, typename = std::enable_if_t<std::is_constructible_v<T, U>>>
-    TypeWrapper(U&& value) : value_(std::forward<U>(value)) {}
-
-    void serialize(Buffer& buffer) const {
-        Id id = static_cast<Id>(detail::type_to_id<T>());
-        detail::serialize_value(id, buffer);
-        detail::serialize_value(value_, buffer);
+    template<class classType, class = std::enable_if_t<std::is_constructible_v<T, classType>>>
+    Wrapper(classType&& type) : _type(std::forward<classType>(type)){}
+    
+    void serialize(Buffer& buffer) {
+        Id id = static_cast<Id>(typeToId<T>());
+        basicSerialization::serialize_type(id, buffer);
+        basicSerialization::serialize_type(_type, buffer);
     }
 
     Buffer::const_iterator deserialize(Buffer::const_iterator begin, Buffer::const_iterator end) {
-        return detail::deserialize_value(begin, end, value_);
+        return basicDeSerialization::deserialize_type(begin, end, _type);
     }
 
-    const T& get() const { return value_; }
-    T& get() { return value_; }
+    const T& getType() const {
+        return _type;
+    }
 
-    bool operator==(const TypeWrapper& other) const {
-        return value_ == other.value_;
+    T& getType() {
+        return _type;
     }
 
 private:
-    T value_;
+    T _type;
 };
 
-class IntegerType : public TypeWrapper<uint64_t> {
+class IntegerType : public Wrapper<uint64_t> {
 public:
-    template<typename... Args>
-    IntegerType(Args&&... args) : TypeWrapper<uint64_t>(std::forward<Args>(args)...) {}
+    template<typename ...Args>
+    IntegerType(Args&&... args) : Wrapper<uint64_t>(std::forward<Args>(args)...) {}
 };
 
-class FloatType : public TypeWrapper<double> {
+class FloatType : public Wrapper<double> {
 public:
-    template<typename... Args>
-    FloatType(Args&&... args) : TypeWrapper<double>(std::forward<Args>(args)...) {}
+    template<typename ...Args>
+    FloatType(Args&&... args) : Wrapper<double>(std::forward<Args>(args)...) {}
 };
 
-class StringType : public TypeWrapper<std::string> {
+class StringType : public Wrapper<std::string> {
 public:
-    template<typename... Args>
-    StringType(Args&&... args) : TypeWrapper<std::string>(std::forward<Args>(args)...) {}
+    template<typename ...Args>
+    StringType(Args&&... args) : Wrapper<std::string>(std::forward<Args>(args)...) {}
 };
 
-class Any;
-
-class VectorType : public TypeWrapper<std::vector<Any>> {
+class VectorType : public Wrapper<std::vector<Any>> {
 public:
-    template<typename... Args>
-    VectorType(Args&&... args) : TypeWrapper<std::vector<Any>>({ std::forward<Args>(args)... }) {}
+    template<typename ...Args>
+    VectorType(Args&&... args) : Wrapper<std::vector<Any>>(std::forward<Args>(args)...) {}
 
-    template<typename Arg>
-    void push_back(Arg&& val) {
-        this->get().emplace_back(std::forward<Arg>(val));
+    template<typename Arg, class = std::enable_if_t<IsValidType<std::decay_t<Arg>>::value>>
+    void push_back(Arg&& _val) {
+        this->getType().emplace_back(std::forward<Arg>(_val));
     }
 };
+
+template<class T>
+using IsValidType = std::disjunction<
+    std::is_same<T, IntegerType>,
+    std::is_same<T, FloatType>,
+    std::is_same<T, StringType>,
+    std::is_same<T, VectorType>,
+    std::is_same<T, Any>>;
 
 class Any {
 public:
-    template<typename T>
-    using IsValidType = std::disjunction<
-        std::is_same<T, IntegerType>,
-        std::is_same<T, FloatType>,
-        std::is_same<T, StringType>,
-        std::is_same<T, VectorType>,
-        std::is_same<T, Any>>;
+    template<class T>
+    using enabledT = std::enable_if_t<IsValidType<std::decay_t<T>>::value>;
 
-    template<typename T, typename = std::enable_if_t<IsValidType<std::decay_t<T>>::value>>
-    Any(T&& value) {
-        using DecayedT = std::decay_t<T>;
-        if constexpr (std::is_same_v<DecayedT, IntegerType>) {
-            data_ = value.get();
-        }
-        else if constexpr (std::is_same_v<DecayedT, FloatType>) {
-            data_ = value.get();
-        }
-        else if constexpr (std::is_same_v<DecayedT, StringType>) {
-            data_ = value.get();
-        }
-        else if constexpr (std::is_same_v<DecayedT, VectorType>) {
-            data_ = value.get();
+    Any() {};
+
+    template<typename ...Args, class = enabledT<Args...>>
+    Any(Args&&... args) {
+        using DecayedT = std::decay_t<std::tuple_element_t<0, std::tuple<Args...>>>;
+        if constexpr (std::is_same_v<DecayedT, IntegerType> || 
+                      std::is_same_v<DecayedT, FloatType>   ||
+                      std::is_same_v<DecayedT, StringType>  ||
+                      std::is_same_v<DecayedT, VectorType>) {
+            this->_data = std::get<0>(std::forward_as_tuple(std::forward<Args>(args)...)).getType();
         }
         else if constexpr (std::is_same_v<DecayedT, Any>) {
-            data_ = value.data_;
+            this->_data = std::get<0>(std::forward_as_tuple(std::forward<Args>(args)...))._data;
         }
     }
 
-    void serialize(Buffer& buffer) const {
-        std::visit([&buffer](const auto& value) {
-            using T = std::decay_t<decltype(value)>;
-            Id id = static_cast<Id>(detail::type_to_id<T>());
-            detail::serialize_value(id, buffer);
-            detail::serialize_value(value, buffer);
-            }, data_);
+    void serialize(Buffer& _buff) const {
+        std::visit([&_buff](const auto& Ttype) {
+            using T = std::decay_t<decltype(Ttype)>;
+            Id id = static_cast<Id>(typeToId<T>());
+            basicSerialization::serialize_type(id, _buff);
+            basicSerialization::serialize_type(Ttype, _buff);
+            }, this->_data);
     }
 
-    Buffer::const_iterator deserialize(Buffer::const_iterator begin, Buffer::const_iterator end) {
+    Buffer::const_iterator deserialize(Buffer::const_iterator _begin, Buffer::const_iterator _end) {
         Id id = 0;
-        begin = detail::deserialize_value(begin, end, id);
+        _begin = basicDeSerialization::deserialize_type(_begin, _end, id);
 
-        switch (static_cast<TypeId>(id)) {
-        case TypeId::Uint: {
-            uint64_t value;
-            begin = detail::deserialize_value(begin, end, value);
-            data_ = value;
+        switch (static_cast<TypeId>(id)){
+        case TypeId::Uint :{
+            uint64_t res = 0;
+            _begin = basicDeSerialization::deserialize_type(_begin, _end, res);
+            this->_data = res;
             break;
         }
         case TypeId::Float: {
-            double value;
-            begin = detail::deserialize_value(begin, end, value);
-            data_ = value;
+            double res = 0;
+            _begin = basicDeSerialization::deserialize_type(_begin, _end, res);
+            this->_data = res;
             break;
         }
         case TypeId::String: {
-            std::string value;
-            begin = detail::deserialize_value(begin, end, value);
-            data_ = value;
+            std::string res;
+            _begin = basicDeSerialization::deserialize_type(_begin, _end, res);
+            this->_data = res;
             break;
         }
-        case TypeId::Vector: {
-            std::vector<Any> value;
-            begin = detail::deserialize_value(begin, end, value);
-            data_ = value;
+        case TypeId::Vector:{
+            std::vector<Any> res;
+            _begin = basicDeSerialization::deserialize_type(_begin, _end, res);
+            this->_data = res;
             break;
         }
         default:
-            throw std::runtime_error("Unknown type id");
+            throw std::runtime_error("Error with type id");
+            break;
         }
-
-        return begin;
+        return _begin;
     }
 
     TypeId getPayloadTypeId() const {
-        return static_cast<TypeId>(data_.index());
+        return static_cast<TypeId>(this->_data.index());
     }
 
     template<typename Type>
     auto& getValue() const {
-        using T = typename Type::value_type;
-        return std::get<T>(data_);
+        return std::get<Type>(this->_data);
     }
 
     template<TypeId kId>
     auto& getValue() const {
-        using T = typename detail::id_to_type<kId>::type;
-        return std::get<T>(data_);
+        return std::get<idToType<kId>::type>(this->_data);
     }
 
-    bool operator==(const Any& other) const {
-        return data_ == other.data_;
+    bool operator == (const Any& _o) const {
+        return this->_data == _o._data;
     }
-
 private:
-    std::variant<uint64_t, double, std::string, std::vector<Any>> data_;
+    //Типы под теме же индексами, что и в enum TypeId
+    std::variant<uint64_t, double, std::string, std::vector<Any>> _data;
 };
 
 class Serializator {
 public:
-    template<typename T, typename = std::enable_if_t<Any::IsValidType<std::decay_t<T>>::value>>
-    void push(T&& val) {
-        storage_.emplace_back(std::forward<T>(val));
+    template<class T>
+    using enabledT = std::enable_if_t<IsValidType<std::decay_t<T>>::value>;
+
+    template<typename Arg, class = enabledT<Arg>>
+    void push(Arg&& _val) {
+        this->_data.emplace_back(std::forward<Arg>(_val));
     }
 
     Buffer serialize() const {
         Buffer buffer;
-        uint64_t size = storage_.size();
-        detail::serialize_value(size, buffer);
-        for (const auto& item : storage_) {
-            item.serialize(buffer);
+        uint64_t size = _data.size();
+        basicSerialization::serialize_type(size, buffer);
+        for (const auto& TType : _data) {
+            TType.serialize(buffer);
         }
         return buffer;
     }
 
-    static std::vector<Any> deserialize(const Buffer& buffer) {
+    static std::vector<Any> deserialize(const Buffer& _val) {
         std::vector<Any> result;
-        auto it = buffer.begin();
+        auto iter = _val.begin();
         uint64_t size = 0;
-        it = detail::deserialize_value(it, buffer.end(), size);
+        iter = basicDeSerialization::deserialize_type(iter, _val.end(), size);
         result.reserve(size);
-        for (uint64_t i = 0; i < size; ++i) {
+        for (size_t i = 0; i < size; ++i) {
             Any any;
-            it = any.deserialize(it, buffer.end());
+            iter = any.deserialize(iter, _val.end());
             result.push_back(any);
         }
         return result;
     }
 
     const std::vector<Any>& getStorage() const {
-        return storage_;
+        return _data;
     }
-
 private:
-    std::vector<Any> storage_;
+    std::vector<Any> _data;
 };
 
 int main() {
+
     std::ifstream raw;
     raw.open("raw.bin", std::ios_base::in | std::ios_base::binary);
     if (!raw.is_open())
@@ -301,14 +308,19 @@ int main() {
 
     Buffer buff(size);
     raw.read(reinterpret_cast<char*>(buff.data()), size);
+    raw.close();
+    try {
+        auto res = Serializator::deserialize(buff);
 
-    auto res = Serializator::deserialize(buff);
+        Serializator s;
+        for (auto&& i : res)
+            s.push(i);
 
-    Serializator s;
-    for (auto&& i : res)
-        s.push(i);
-
-    std::cout << (buff == s.serialize()) << '\n';
+        std::cout << (buff == s.serialize()) << '\n';
+    }
+    catch (std::exception& ex) {
+        std::cerr << ex.what() << std::endl;
+    }
 
     return 0;
 }
