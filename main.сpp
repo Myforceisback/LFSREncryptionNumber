@@ -1,5 +1,295 @@
-RisipCall* call = getCurrentCall(); // получи активный звонок
+# Реализация серверной части IKEv2 (первая фаза) на C++17 с Boost (без OpenSSL)
 
-if (call) {
-    call->AjustRxLevel(0); // или AdjustRxLevel(0), если с 'd'
+без использования OpenSSL, с альтернативными криптографическими решениями.
+
+## Заголовочные файлы и зависимости
+
+```cpp
+#include <iostream>
+#include <memory>
+#include <vector>
+#include <array>
+#include <cstdint>
+#include <random>
+#include <boost/asio.hpp>
+#include <boost/endian/conversion.hpp>
+#include <boost/optional.hpp>
+#include <botan-2/botan/all.h> // Используем Botan вместо OpenSSL
+```
+
+## Структуры данных IKEv2
+
+```cpp
+namespace ikev2 {
+
+// IKEv2 Header
+struct Header {
+    std::array<uint8_t, 8> initiator_spi;
+    std::array<uint8_t, 8> responder_spi;
+    uint8_t next_payload;
+    uint8_t version;
+    uint8_t exchange_type;
+    uint8_t flags;
+    uint32_t message_id;
+    uint32_t length;
+
+    void network_to_host() {
+        length = boost::endian::big_to_native(length);
+        message_id = boost::endian::big_to_native(message_id);
+    }
+
+    void host_to_network() {
+        length = boost::endian::native_to_big(length);
+        message_id = boost::endian::native_to_big(message_id);
+    }
+};
+
+// Базовый интерфейс для payload
+struct Payload {
+    uint8_t next_payload;
+    uint8_t critical;
+    uint16_t length;
+    
+    virtual std::vector<uint8_t> serialize() const = 0;
+    virtual ~Payload() = default;
+};
+
+// SA Payload
+struct SaPayload : Payload {
+    std::vector<uint8_t> proposals;
+    
+    std::vector<uint8_t> serialize() const override {
+        std::vector<uint8_t> data;
+        data.push_back(next_payload);
+        data.push_back(critical);
+        data.push_back(static_cast<uint8_t>(length >> 8));
+        data.push_back(static_cast<uint8_t>(length));
+        data.insert(data.end(), proposals.begin(), proposals.end());
+        return data;
+    }
+};
+
+// KE Payload
+struct KePayload : Payload {
+    uint16_t dh_group;
+    std::vector<uint8_t> key_data;
+    
+    std::vector<uint8_t> serialize() const override {
+        std::vector<uint8_t> data;
+        data.push_back(next_payload);
+        data.push_back(critical);
+        // Length (2 bytes)
+        uint16_t len = static_cast<uint16_t>(4 + key_data.size());
+        data.push_back(static_cast<uint8_t>(len >> 8));
+        data.push_back(static_cast<uint8_t>(len));
+        // DH Group (2 bytes)
+        data.push_back(static_cast<uint8_t>(dh_group >> 8));
+        data.push_back(static_cast<uint8_t>(dh_group));
+        // Reserved (2 bytes)
+        data.push_back(0);
+        data.push_back(0);
+        // Key Data
+        data.insert(data.end(), key_data.begin(), key_data.end());
+        return data;
+    }
+};
+
+// Nonce Payload
+struct NoncePayload : Payload {
+    std::vector<uint8_t> nonce;
+    
+    std::vector<uint8_t> serialize() const override {
+        std::vector<uint8_t> data;
+        data.push_back(next_payload);
+        data.push_back(critical);
+        // Length (2 bytes)
+        uint16_t len = static_cast<uint16_t>(4 + nonce.size());
+        data.push_back(static_cast<uint8_t>(len >> 8));
+        data.push_back(static_cast<uint8_t>(len));
+        // Nonce Data
+        data.insert(data.end(), nonce.begin(), nonce.end());
+        return data;
+    }
+};
+
+} // namespace ikev2
+```
+
+## Класс IKEv2 Server
+
+```cpp
+class IKEv2Server {
+public:
+    IKEv2Server(boost::asio::io_context& io_context, uint16_t port)
+        : socket_(io_context, boost::asio::ip::udp::v4()),
+          rng_(Botan::system_rng()) {
+        
+        boost::asio::ip::udp::endpoint endpoint(boost::asio::ip::udp::v4(), port);
+        socket_.bind(endpoint);
+        
+        // Генерация статического DH ключа для сервера
+        Botan::DL_Group group("modp/2048");
+        dh_private_ = Botan::PKCS8::load_key(rng_, group);
+        
+        start_receive();
+    }
+
+private:
+    void start_receive() {
+        socket_.async_receive_from(
+            boost::asio::buffer(recv_buffer_), remote_endpoint_,
+            [this](boost::system::error_code ec, std::size_t bytes_recvd) {
+                if (!ec && bytes_recvd > 0) {
+                    handle_request(bytes_recvd);
+                }
+                start_receive();
+            });
+    }
+
+    void handle_request(std::size_t bytes_received) {
+        try {
+            // Парсинг заголовка IKEv2
+            if (bytes_received < sizeof(ikev2::Header)) {
+                std::cerr << "Too short IKEv2 packet\n";
+                return;
+            }
+
+            ikev2::Header header;
+            std::memcpy(&header, recv_buffer_.data(), sizeof(header));
+            header.network_to_host();
+
+            // Проверка версии IKEv2
+            if (header.version != 0x20) {
+                std::cerr << "Unsupported IKE version\n";
+                return;
+            }
+
+            // Обработка IKE_SA_INIT запроса
+            if (header.exchange_type == 34) { // IKE_SA_INIT
+                process_ike_sa_init(header, bytes_received);
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Error processing IKEv2 request: " << e.what() << "\n";
+        }
+    }
+
+    void process_ike_sa_init(const ikev2::Header& header, std::size_t packet_size) {
+        // Генерация SPI для ответа
+        std::array<uint8_t, 8> responder_spi;
+        rng_->randomize(responder_spi.data(), responder_spi.size());
+
+        // Генерация nonce
+        std::vector<uint8_t> server_nonce(32);
+        rng_->randomize(server_nonce.data(), server_nonce.size());
+
+        // Создание ответного сообщения
+        ikev2::Header response_header;
+        std::memcpy(response_header.initiator_spi.data(), header.initiator_spi.data(), 8);
+        std::memcpy(response_header.responder_spi.data(), responder_spi.data(), 8);
+        response_header.next_payload = 33; // SA payload
+        response_header.version = 0x20;
+        response_header.exchange_type = 34; // IKE_SA_INIT
+        response_header.flags = (1 << 7); // Response bit set
+        response_header.message_id = 0;
+
+        // SA Payload
+        ikev2::SaPayload sa_payload;
+        sa_payload.next_payload = 34; // KE payload
+        sa_payload.critical = 0;
+        // Здесь должны быть реальные предложения по алгоритмам
+        sa_payload.proposals = { /* предложения безопасности */ };
+        sa_payload.length = 4 + sa_payload.proposals.size();
+
+        // KE Payload
+        ikev2::KePayload ke_payload;
+        ke_payload.next_payload = 40; // Nonce payload
+        ke_payload.critical = 0;
+        ke_payload.dh_group = 14; // group14 (2048-bit MODP)
+        
+        // Генерация публичного ключа DH
+        Botan::PK_Key_Agreement ka(*dh_private_, rng_, "Raw");
+        auto pub_key = dh_private_->public_value();
+        ke_payload.key_data.assign(pub_key.begin(), pub_key.end());
+        ke_payload.length = 4 + 4 + ke_payload.key_data.size(); // 4 заголовок + 4 специфичных поля + данные
+
+        // Nonce Payload
+        ikev2::NoncePayload nonce_payload;
+        nonce_payload.next_payload = 0; // No more payloads
+        nonce_payload.critical = 0;
+        nonce_payload.nonce = server_nonce;
+        nonce_payload.length = 4 + nonce_payload.nonce.size();
+
+        // Сборка сообщения
+        std::vector<uint8_t> response_message;
+        
+        // Сначала добавляем payloads (чтобы знать общий размер)
+        auto sa_data = sa_payload.serialize();
+        auto ke_data = ke_payload.serialize();
+        auto nonce_data = nonce_payload.serialize();
+        
+        response_message.insert(response_message.end(), sa_data.begin(), sa_data.end());
+        response_message.insert(response_message.end(), ke_data.begin(), ke_data.end());
+        response_message.insert(response_message.end(), nonce_data.begin(), nonce_data.end());
+        
+        // Устанавливаем длину в заголовке
+        response_header.length = sizeof(ikev2::Header) + response_message.size();
+        response_header.host_to_network();
+        
+        // Вставляем заголовок в начало
+        response_message.insert(response_message.begin(), 
+                              reinterpret_cast<uint8_t*>(&response_header),
+                              reinterpret_cast<uint8_t*>(&response_header) + sizeof(response_header));
+        
+        // Отправка ответа
+        socket_.send_to(boost::asio::buffer(response_message), remote_endpoint_);
+    }
+
+    boost::asio::ip::udp::socket socket_;
+    boost::asio::ip::udp::endpoint remote_endpoint_;
+    std::array<uint8_t, 4096> recv_buffer_;
+    
+    // Криптографические компоненты
+    std::unique_ptr<Botan::RandomNumberGenerator> rng_;
+    std::unique_ptr<Botan::Private_Key> dh_private_;
+};
+```
+
+## Пример использования
+
+```cpp
+int main() {
+    try {
+        boost::asio::io_context io_context;
+        IKEv2Server server(io_context, 500); // Порт 500 стандартный для IKEv2
+        
+        std::cout << "IKEv2 Server started on port 500\n";
+        io_context.run();
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
+    return 0;
 }
+```
+
+## Компиляция
+
+Для компиляции вам понадобится:
+- Установленный Boost (Asio)
+- Библиотека Botan 2.x
+
+Пример команды компиляции (для g++):
+```bash
+g++ -std=c++17 -o ikev2_server ikev2_server.cpp -lboost_system -lbotan-2
+```
+
+## Примечания
+
+1. В этой реализации используется библиотека Botan вместо OpenSSL для криптографических операций.
+2. Реализация включает базовую обработку IKE_SA_INIT запросов.
+3. Для полной реализации необходимо добавить:
+   - Проверку предложений клиента
+   - Реализацию аутентификации (вторая фаза IKEv2)
+   - Обработку ошибок
+   - Поддержку NAT-Traversal
+4. В реальной системе следует добавить логирование и более строгую обработку ошибок.
