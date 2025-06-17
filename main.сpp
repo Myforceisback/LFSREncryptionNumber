@@ -293,3 +293,620 @@ g++ -std=c++17 -o ikev2_server ikev2_server.cpp -lboost_system -lbotan-2
    - Обработку ошибок
    - Поддержку NAT-Traversal
 4. В реальной системе следует добавить логирование и более строгую обработку ошибок.
+
+
+
+
+# Полная реализация стадии IKE_AUTH протокола IKEv2 на C++ с сохранением SA в SQLite3
+
+Вот полная реализация стадии IKE_AUTH протокола IKEv2 с сохранением Security Association (SA) в базе данных SQLite3.
+
+```cpp
+#include <iostream>
+#include <vector>
+#include <string>
+#include <memory>
+#include <sqlite3.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/rand.h>
+
+// Структуры для хранения данных IKEv2
+struct IKEv2Header {
+    uint8_t initiator_spi[8];
+    uint8_t responder_spi[8];
+    uint8_t next_payload;
+    uint8_t version;
+    uint8_t exchange_type;
+    uint8_t flags;
+    uint32_t message_id;
+    uint32_t length;
+};
+
+struct IKEv2Payload {
+    uint8_t next_payload;
+    uint8_t flags;
+    uint16_t length;
+    std::vector<uint8_t> data;
+};
+
+struct IKEv2SA {
+    std::vector<uint8_t> initiator_spi;
+    std::vector<uint8_t> responder_spi;
+    std::vector<uint8_t> encryption_key;
+    std::vector<uint8_t> integrity_key;
+    std::vector<uint8_t> prf_key;
+    std::vector<uint8_t> initiator_nonce;
+    std::vector<uint8_t> responder_nonce;
+    std::vector<uint8_t> shared_secret;
+    uint32_t lifetime;
+};
+
+// Класс для работы с базой данных SQLite3
+class IKEDatabase {
+public:
+    IKEDatabase(const std::string& db_path) {
+        if (sqlite3_open(db_path.c_str(), &db_) != SQLITE_OK) {
+            throw std::runtime_error("Can't open database: " + std::string(sqlite3_errmsg(db_)));
+        }
+        
+        // Создаем таблицу для хранения SA
+        const char* create_table_sql = 
+            "CREATE TABLE IF NOT EXISTS security_associations ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "initiator_spi BLOB NOT NULL,"
+            "responder_spi BLOB NOT NULL,"
+            "encryption_key BLOB NOT NULL,"
+            "integrity_key BLOB NOT NULL,"
+            "prf_key BLOB NOT NULL,"
+            "initiator_nonce BLOB NOT NULL,"
+            "responder_nonce BLOB NOT NULL,"
+            "shared_secret BLOB NOT NULL,"
+            "lifetime INTEGER NOT NULL,"
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            ");";
+        
+        char* err_msg = nullptr;
+        if (sqlite3_exec(db_, create_table_sql, nullptr, nullptr, &err_msg) != SQLITE_OK) {
+            std::string error = "SQL error: " + std::string(err_msg);
+            sqlite3_free(err_msg);
+            throw std::runtime_error(error);
+        }
+    }
+    
+    ~IKEDatabase() {
+        sqlite3_close(db_);
+    }
+    
+    bool saveSA(const IKEv2SA& sa) {
+        const char* insert_sql = 
+            "INSERT INTO security_associations "
+            "(initiator_spi, responder_spi, encryption_key, integrity_key, prf_key, "
+            "initiator_nonce, responder_nonce, shared_secret, lifetime) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        
+        sqlite3_stmt* stmt;
+        if (sqlite3_prepare_v2(db_, insert_sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            return false;
+        }
+        
+        // Привязываем параметры
+        sqlite3_bind_blob(stmt, 1, sa.initiator_spi.data(), sa.initiator_spi.size(), SQLITE_STATIC);
+        sqlite3_bind_blob(stmt, 2, sa.responder_spi.data(), sa.responder_spi.size(), SQLITE_STATIC);
+        sqlite3_bind_blob(stmt, 3, sa.encryption_key.data(), sa.encryption_key.size(), SQLITE_STATIC);
+        sqlite3_bind_blob(stmt, 4, sa.integrity_key.data(), sa.integrity_key.size(), SQLITE_STATIC);
+        sqlite3_bind_blob(stmt, 5, sa.prf_key.data(), sa.prf_key.size(), SQLITE_STATIC);
+        sqlite3_bind_blob(stmt, 6, sa.initiator_nonce.data(), sa.initiator_nonce.size(), SQLITE_STATIC);
+        sqlite3_bind_blob(stmt, 7, sa.responder_nonce.data(), sa.responder_nonce.size(), SQLITE_STATIC);
+        sqlite3_bind_blob(stmt, 8, sa.shared_secret.data(), sa.shared_secret.size(), SQLITE_STATIC);
+        sqlite3_bind_int(stmt, 9, sa.lifetime);
+        
+        int result = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        
+        return result == SQLITE_DONE;
+    }
+    
+    IKEv2SA getSA(const std::vector<uint8_t>& initiator_spi, const std::vector<uint8_t>& responder_spi) {
+        const char* select_sql = 
+            "SELECT encryption_key, integrity_key, prf_key, initiator_nonce, "
+            "responder_nonce, shared_secret, lifetime FROM security_associations "
+            "WHERE initiator_spi = ? AND responder_spi = ?;";
+        
+        sqlite3_stmt* stmt;
+        if (sqlite3_prepare_v2(db_, select_sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            throw std::runtime_error("Failed to prepare SQL statement");
+        }
+        
+        sqlite3_bind_blob(stmt, 1, initiator_spi.data(), initiator_spi.size(), SQLITE_STATIC);
+        sqlite3_bind_blob(stmt, 2, responder_spi.data(), responder_spi.size(), SQLITE_STATIC);
+        
+        IKEv2SA sa;
+        sa.initiator_spi = initiator_spi;
+        sa.responder_spi = responder_spi;
+        
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            // Получаем данные из результата запроса
+            const void* enc_key = sqlite3_column_blob(stmt, 0);
+            sa.encryption_key.assign(
+                static_cast<const uint8_t*>(enc_key),
+                static_cast<const uint8_t*>(enc_key) + sqlite3_column_bytes(stmt, 0)
+            );
+            
+            const void* int_key = sqlite3_column_blob(stmt, 1);
+            sa.integrity_key.assign(
+                static_cast<const uint8_t*>(int_key),
+                static_cast<const uint8_t*>(int_key) + sqlite3_column_bytes(stmt, 1)
+            );
+            
+            const void* prf_key = sqlite3_column_blob(stmt, 2);
+            sa.prf_key.assign(
+                static_cast<const uint8_t*>(prf_key),
+                static_cast<const uint8_t*>(prf_key) + sqlite3_column_bytes(stmt, 2)
+            );
+            
+            const void* init_nonce = sqlite3_column_blob(stmt, 3);
+            sa.initiator_nonce.assign(
+                static_cast<const uint8_t*>(init_nonce),
+                static_cast<const uint8_t*>(init_nonce) + sqlite3_column_bytes(stmt, 3)
+            );
+            
+            const void* resp_nonce = sqlite3_column_blob(stmt, 4);
+            sa.responder_nonce.assign(
+                static_cast<const uint8_t*>(resp_nonce),
+                static_cast<const uint8_t*>(resp_nonce) + sqlite3_column_bytes(stmt, 4)
+            );
+            
+            const void* shared_sec = sqlite3_column_blob(stmt, 5);
+            sa.shared_secret.assign(
+                static_cast<const uint8_t*>(shared_sec),
+                static_cast<const uint8_t*>(shared_sec) + sqlite3_column_bytes(stmt, 5)
+            );
+            
+            sa.lifetime = sqlite3_column_int(stmt, 6);
+        }
+        
+        sqlite3_finalize(stmt);
+        return sa;
+    }
+    
+private:
+    sqlite3* db_;
+};
+
+// Класс для реализации IKEv2
+class IKEv2Protocol {
+public:
+    IKEv2Protocol(const std::string& db_path) : db_(db_path) {}
+    
+    // Обработка сообщения IKE_AUTH
+    std::vector<uint8_t> processIKEAuth(const std::vector<uint8_t>& request) {
+        // Парсим заголовок
+        IKEv2Header header;
+        if (request.size() < sizeof(IKEv2Header)) {
+            throw std::runtime_error("Invalid IKEv2 message size");
+        }
+        
+        memcpy(&header, request.data(), sizeof(IKEv2Header));
+        
+        // Проверяем, что это сообщение IKE_AUTH
+        if (header.exchange_type != 2) { // 2 = IKE_AUTH
+            throw std::runtime_error("Not an IKE_AUTH message");
+        }
+        
+        // Парсим полезные нагрузки
+        std::vector<IKEv2Payload> payloads = parsePayloads(request);
+        
+        // Обрабатываем полезные нагрузки IKE_AUTH
+        IKEv2SA sa;
+        sa.initiator_spi.assign(header.initiator_spi, header.initiator_spi + 8);
+        sa.responder_spi.assign(header.responder_spi, header.responder_spi + 8);
+        
+        // Генерируем ключи (в реальной реализации это должно быть на основе обмена в IKE_SA_INIT)
+        generateKeys(sa);
+        
+        // Проверяем аутентификацию (упрощенно)
+        if (!verifyAuthentication(payloads, sa)) {
+            throw std::runtime_error("Authentication failed");
+        }
+        
+        // Сохраняем SA в базу данных
+        if (!db_.saveSA(sa)) {
+            throw std::runtime_error("Failed to save SA to database");
+        }
+        
+        // Формируем ответное сообщение
+        return createResponse(header, sa);
+    }
+    
+private:
+    IKEDatabase db_;
+    
+    std::vector<IKEv2Payload> parsePayloads(const std::vector<uint8_t>& message) {
+        std::vector<IKEv2Payload> payloads;
+        size_t offset = sizeof(IKEv2Header);
+        
+        while (offset < message.size()) {
+            IKEv2Payload payload;
+            payload.next_payload = message[offset];
+            payload.flags = message[offset + 1];
+            
+            uint16_t length;
+            memcpy(&length, message.data() + offset + 2, 2);
+            payload.length = ntohs(length);
+            
+            if (offset + payload.length > message.size()) {
+                throw std::runtime_error("Invalid payload length");
+            }
+            
+            payload.data.assign(message.begin() + offset + 4, message.begin() + offset + payload.length);
+            payloads.push_back(payload);
+            
+            if (payload.next_payload == 0) {
+                break; // Нет следующих полезных нагрузок
+            }
+            
+            offset += payload.length;
+        }
+        
+        return payloads;
+    }
+    
+    void generateKeys(IKEv2SA& sa) {
+        // В реальной реализации ключи должны быть сгенерированы на основе обмена в IKE_SA_INIT
+        // Здесь для примера генерируем случайные значения
+        
+        sa.encryption_key.resize(32); // AES-256
+        RAND_bytes(sa.encryption_key.data(), sa.encryption_key.size());
+        
+        sa.integrity_key.resize(32); // HMAC-SHA256
+        RAND_bytes(sa.integrity_key.data(), sa.integrity_key.size());
+        
+        sa.prf_key.resize(32);
+        RAND_bytes(sa.prf_key.data(), sa.prf_key.size());
+        
+        sa.initiator_nonce.resize(32);
+        RAND_bytes(sa.initiator_nonce.data(), sa.initiator_nonce.size());
+        
+        sa.responder_nonce.resize(32);
+        RAND_bytes(sa.responder_nonce.data(), sa.responder_nonce.size());
+        
+        sa.shared_secret.resize(32);
+        RAND_bytes(sa.shared_secret.data(), sa.shared_secret.size());
+        
+        sa.lifetime = 3600; // 1 hour
+    }
+    
+    bool verifyAuthentication(const std::vector<IKEv2Payload>& payloads, const IKEv2SA& sa) {
+        // В реальной реализации здесь должна быть проверка аутентификации
+        // на основе общих секретов и криптографических алгоритмов
+        // Здесь для примера просто возвращаем true
+        
+        return true;
+    }
+    
+    std::vector<uint8_t> createResponse(const IKEv2Header& request_header, const IKEv2SA& sa) {
+        std::vector<uint8_t> response;
+        IKEv2Header header;
+        
+        // Копируем SPI из запроса
+        memcpy(header.initiator_spi, request_header.initiator_spi, 8);
+        memcpy(header.responder_spi, request_header.responder_spi, 8);
+        
+        header.next_payload = 0; // Нет следующих полезных нагрузок
+        header.version = 0x20; // IKEv2
+        header.exchange_type = 2; // IKE_AUTH
+        header.flags = 0; // Инициатор - запрос
+        header.message_id = request_header.message_id;
+        
+        // Создаем полезные нагрузки для ответа
+        std::vector<uint8_t> payloads;
+        
+        // IDr (идентификатор ответчика)
+        std::vector<uint8_t> idr_payload = createIDrPayload();
+        
+        // AUTH (аутентификация)
+        std::vector<uint8_t> auth_payload = createAuthPayload(sa);
+        
+        // SA (Security Association)
+        std::vector<uint8_t> sa_payload = createSAPayload(sa);
+        
+        // TSi (Traffic Selector - инициатор)
+        std::vector<uint8_t> tsi_payload = createTSiPayload();
+        
+        // TSr (Traffic Selector - ответчик)
+        std::vector<uint8_t> tsr_payload = createTSrPayload();
+        
+        // Собираем все полезные нагрузки
+        payloads.insert(payloads.end(), idr_payload.begin(), idr_payload.end());
+        payloads.insert(payloads.end(), auth_payload.begin(), auth_payload.end());
+        payloads.insert(payloads.end(), sa_payload.begin(), sa_payload.end());
+        payloads.insert(payloads.end(), tsi_payload.begin(), tsi_payload.end());
+        payloads.insert(payloads.end(), tsr_payload.begin(), tsr_payload.end());
+        
+        // Устанавливаем длину сообщения
+        header.length = htonl(sizeof(IKEv2Header) + payloads.size());
+        
+        // Собираем полное сообщение
+        response.resize(sizeof(IKEv2Header));
+        memcpy(response.data(), &header, sizeof(IKEv2Header));
+        response.insert(response.end(), payloads.begin(), payloads.end());
+        
+        return response;
+    }
+    
+    std::vector<uint8_t> createIDrPayload() {
+        // Создаем полезную нагрузку IDr
+        std::vector<uint8_t> payload;
+        
+        // Заголовок полезной нагрузки
+        payload.push_back(0); // Next Payload (будет установлен позже)
+        payload.push_back(0); // Flags
+        payload.push_back(0); // Length (будет установлен позже)
+        payload.push_back(0);
+        
+        // Тип ID (FQDN)
+        payload.push_back(2);
+        
+        // Протокол ID (0 для IKE)
+        payload.push_back(0);
+        
+        // Порт (0 для IKE)
+        payload.push_back(0);
+        payload.push_back(0);
+        
+        // Данные ID (например, "vpn.example.com")
+        std::string id = "vpn.example.com";
+        payload.insert(payload.end(), id.begin(), id.end());
+        
+        // Устанавливаем длину
+        uint16_t length = payload.size();
+        payload[2] = (length >> 8) & 0xFF;
+        payload[3] = length & 0xFF;
+        
+        return payload;
+    }
+    
+    std::vector<uint8_t> createAuthPayload(const IKEv2SA& sa) {
+        // Создаем полезную нагрузку AUTH
+        std::vector<uint8_t> payload;
+        
+        // Заголовок полезной нагрузки
+        payload.push_back(0); // Next Payload (будет установлен позже)
+        payload.push_back(0); // Flags
+        payload.push_back(0); // Length (будет установлен позже)
+        payload.push_back(0);
+        
+        // Метод аутентификации (Shared Key)
+        payload.push_back(2);
+        
+        // Данные аутентификации (в реальной реализации это должна быть HMAC)
+        std::vector<uint8_t> auth_data(32); // Размер HMAC-SHA256
+        HMAC(EVP_sha256(), sa.shared_secret.data(), sa.shared_secret.size(),
+             sa.initiator_nonce.data(), sa.initiator_nonce.size(),
+             auth_data.data(), nullptr);
+        
+        payload.insert(payload.end(), auth_data.begin(), auth_data.end());
+        
+        // Устанавливаем длину
+        uint16_t length = payload.size();
+        payload[2] = (length >> 8) & 0xFF;
+        payload[3] = length & 0xFF;
+        
+        return payload;
+    }
+    
+    std::vector<uint8_t> createSAPayload(const IKEv2SA& sa) {
+        // Создаем полезную нагрузку SA
+        std::vector<uint8_t> payload;
+        
+        // Заголовок полезной нагрузки
+        payload.push_back(0); // Next Payload (будет установлен позже)
+        payload.push_back(0); // Flags
+        payload.push_back(0); // Length (будет установлен позже)
+        payload.push_back(0);
+        
+        // Предложения SA (Proposal)
+        std::vector<uint8_t> proposal = createSAProposal(sa);
+        payload.insert(payload.end(), proposal.begin(), proposal.end());
+        
+        // Устанавливаем длину
+        uint16_t length = payload.size();
+        payload[2] = (length >> 8) & 0xFF;
+        payload[3] = length & 0xFF;
+        
+        return payload;
+    }
+    
+    std::vector<uint8_t> createSAProposal(const IKEv2SA& sa) {
+        // Создаем предложение SA
+        std::vector<uint8_t> proposal;
+        
+        // Номер предложения
+        proposal.push_back(1);
+        
+        // Протокол ID (IKE)
+        proposal.push_back(1);
+        
+        // Размер SPI (8 байт для IKE)
+        proposal.push_back(8);
+        
+        // Количество трансформаций
+        proposal.push_back(3); // ENCR, PRF, INTEG
+        
+        // SPI (используем responder_spi)
+        proposal.insert(proposal.end(), sa.responder_spi.begin(), sa.responder_spi.end());
+        
+        // Трансформация ENCR (AES-CBC-256)
+        proposal.push_back(3); // ENCR
+        proposal.push_back(1); // Last transform
+        proposal.push_back(0); // Transform length (будет установлен позже)
+        proposal.push_back(12);
+        
+        // ID шифрования (AES-CBC)
+        proposal.push_back(0);
+        proposal.push_back(12);
+        
+        // Атрибуты
+        // Key length (256 bits)
+        proposal.push_back(0x80);
+        proposal.push_back(0x0E);
+        proposal.push_back(0x00);
+        proposal.push_back(0x80);
+        
+        // Устанавливаем длину трансформации
+        uint16_t transform_length = 12;
+        proposal[proposal.size() - transform_length + 2] = (transform_length >> 8) & 0xFF;
+        proposal[proposal.size() - transform_length + 3] = transform_length & 0xFF;
+        
+        // Трансформация PRF (HMAC-SHA256)
+        proposal.push_back(4); // PRF
+        proposal.push_back(2); // Last transform
+        proposal.push_back(0); // Transform length (будет установлен позже)
+        proposal.push_back(8);
+        
+        // ID PRF (HMAC-SHA256)
+        proposal.push_back(0);
+        proposal.push_back(5);
+        
+        // Устанавливаем длину трансформации
+        transform_length = 8;
+        proposal[proposal.size() - transform_length + 2] = (transform_length >> 8) & 0xFF;
+        proposal[proposal.size() - transform_length + 3] = transform_length & 0xFF;
+        
+        // Трансформация INTEG (HMAC-SHA256-128)
+        proposal.push_back(5); // INTEG
+        proposal.push_back(3); // Last transform
+        proposal.push_back(0); // Transform length (будет установлен позже)
+        proposal.push_back(8);
+        
+        // ID integrity (HMAC-SHA256-128)
+        proposal.push_back(0);
+        proposal.push_back(12);
+        
+        // Устанавливаем длину трансформации
+        transform_length = 8;
+        proposal[proposal.size() - transform_length + 2] = (transform_length >> 8) & 0xFF;
+        proposal[proposal.size() - transform_length + 3] = transform_length & 0xFF;
+        
+        return proposal;
+    }
+    
+    std::vector<uint8_t> createTSiPayload() {
+        // Создаем полезную нагрузку TSi
+        std::vector<uint8_t> payload;
+        
+        // Заголовок полезной нагрузки
+        payload.push_back(0); // Next Payload (будет установлен позже)
+        payload.push_back(0); // Flags
+        payload.push_back(0); // Length (будет установлен позже)
+        payload.push_back(0);
+        
+        // Количество TS
+        payload.push_back(1);
+        
+        // Тип TS (IPv4 диапазон адресов)
+        payload.push_back(7);
+        
+        // Протокол ID (любой)
+        payload.push_back(0);
+        
+        // Длина селектора
+        payload.push_back(0);
+        payload.push_back(16); // 16 байт
+        
+        // Начальный порт (любой)
+        payload.push_back(0);
+        payload.push_back(0);
+        
+        // Конечный порт (любой)
+        payload.push_back(0);
+        payload.push_back(0);
+        
+        // Начальный адрес (0.0.0.0)
+        payload.push_back(0);
+        payload.push_back(0);
+        payload.push_back(0);
+        payload.push_back(0);
+        
+        // Конечный адрес (255.255.255.255)
+        payload.push_back(255);
+        payload.push_back(255);
+        payload.push_back(255);
+        payload.push_back(255);
+        
+        // Устанавливаем длину
+        uint16_t length = payload.size();
+        payload[2] = (length >> 8) & 0xFF;
+        payload[3] = length & 0xFF;
+        
+        return payload;
+    }
+    
+    std::vector<uint8_t> createTSrPayload() {
+        // Аналогично TSi, но для ответчика
+        return createTSiPayload();
+    }
+};
+
+int main() {
+    try {
+        // Инициализация IKEv2
+        IKEv2Protocol ike("ike_sa.db");
+        
+        // Пример обработки IKE_AUTH сообщения (заглушка)
+        std::vector<uint8_t> ike_auth_request(256); // В реальности это должно быть получено от клиента
+        std::vector<uint8_t> response = ike.processIKEAuth(ike_auth_request);
+        
+        std::cout << "IKE_AUTH response generated, size: " << response.size() << " bytes" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+    
+    return 0;
+}
+```
+
+## Описание реализации
+
+1. **Структуры данных**:
+   - `IKEv2Header` - заголовок сообщения IKEv2
+   - `IKEv2Payload` - полезная нагрузка IKEv2
+   - `IKEv2SA` - Security Association (SA) с параметрами безопасности
+
+2. **Класс IKEDatabase**:
+   - Обеспечивает сохранение и загрузку SA в/из SQLite3
+   - Создает таблицу для хранения SA при инициализации
+   - Предоставляет методы `saveSA()` и `getSA()`
+
+3. **Класс IKEv2Protocol**:
+   - Основной класс для обработки IKEv2 сообщений
+   - Метод `processIKEAuth()` обрабатывает сообщение IKE_AUTH
+   - Включает методы для генерации ключей, проверки аутентификации и создания ответа
+
+4. **Генерация полезных нагрузок**:
+   - `createIDrPayload()` - идентификатор ответчика
+   - `createAuthPayload()` - аутентификационные данные
+   - `createSAPayload()` - параметры Security Association
+   - `createTSiPayload()` и `createTSrPayload()` - селекторы трафика
+
+5. **Криптографические операции**:
+   - Используется OpenSSL для HMAC и генерации случайных чисел
+   - В реальной реализации следует добавить больше проверок безопасности
+
+## Зависимости
+
+Для компиляции этой реализации потребуются:
+- Библиотека SQLite3
+- OpenSSL (для криптографических операций)
+- Компилятор C++ с поддержкой C++11 или новее
+
+## Примечания
+
+Это упрощенная реализация. В реальном VPN-решении необходимо:
+1. Добавить обработку ошибок и проверки безопасности
+2. Реализовать полный обмен IKE_SA_INIT перед IKE_AUTH
+3. Добавить поддержку NAT-Traversal (NAT-T)
+4. Реализовать более сложную логику выбора алгоритмов
+5. Добавить поддержку конфигурации клиента (CP)
