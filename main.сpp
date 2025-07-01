@@ -1,3 +1,4 @@
+
 # Реализация серверной части IKEv2 (первая фаза) на C++17 с Boost (без OpenSSL)
 
 без использования OpenSSL, с альтернативными криптографическими решениями.
@@ -910,3 +911,320 @@ int main() {
 3. Добавить поддержку NAT-Traversal (NAT-T)
 4. Реализовать более сложную логику выбора алгоритмов
 5. Добавить поддержку конфигурации клиента (CP)
+
+#include <boost/asio.hpp>
+#include <boost/endian/conversion.hpp>
+#include <vector>
+#include <memory>
+#include <cstdint>
+#include <array>
+#include <stdexcept>
+#include <algorithm>
+
+// Предполагаемые заголовки для криптографических функций
+#include "magma_cipher.h"
+#include "imitovstavka.h"
+
+namespace ipsec {
+
+// Константы для ESP
+constexpr uint8_t ESP_DEFAULT_PAD = 0x00;
+constexpr uint8_t ESP_PAD_NEXT = 0x01;
+constexpr size_t ESP_IV_LENGTH = 8; // Для Магмы IV 64 бита
+constexpr size_t ESP_MAX_PADDING = 255;
+
+// Структура заголовка ESP
+struct EspHeader {
+    uint32_t spi;       // Security Parameters Index
+    uint32_t seq;       // Sequence Number
+    uint8_t iv[ESP_IV_LENGTH]; // Initialization Vector
+    
+    // Приведение к сетевому порядку байт
+    void to_network_order() {
+        spi = boost::endian::native_to_big(spi);
+        seq = boost::endian::native_to_big(seq);
+    }
+    
+    // Приведение к хостовому порядку байт
+    void to_host_order() {
+        spi = boost::endian::big_to_native(spi);
+        seq = boost::endian::big_to_native(seq);
+    }
+};
+
+// Структура трейлера ESP
+struct EspTrailer {
+    uint8_t pad_length; // Длина padding
+    uint8_t next_header; // Следующий заголовок
+    
+    // Добавляем padding
+    std::vector<uint8_t> padding;
+    
+    // Имитовставка (ICV) будет добавлена после трейлера
+};
+
+// Класс для работы с ESP
+class EspProcessor {
+public:
+    // Конструктор с зависимостями
+    EspProcessor(std::shared_ptr<MagmaCipher> cipher, 
+                std::shared_ptr<Imitovstavka> auth)
+        : cipher_(cipher), auth_(auth) {}
+    
+    // Инкапсуляция ESP пакета
+    std::vector<uint8_t> encapsulate(
+        const std::vector<uint8_t>& payload,
+        uint32_t spi,
+        uint32_t seq_num,
+        uint8_t next_header,
+        const std::vector<uint8_t>& key,
+        const std::vector<uint8_t>& auth_key) {
+        
+        // 1. Создаем ESP заголовок
+        EspHeader header;
+        header.spi = spi;
+        header.seq = seq_num;
+        
+        // Генерируем IV
+        std::array<uint8_t, ESP_IV_LENGTH> iv;
+        generate_iv(iv);
+        std::copy(iv.begin(), iv.end(), header.iv);
+        
+        // 2. Подготавливаем данные для шифрования (payload + trailer)
+        EspTrailer trailer;
+        
+        // Вычисляем необходимый padding
+        size_t block_size = cipher_->block_size();
+        size_t data_len = payload.size() + sizeof(trailer.pad_length) + sizeof(trailer.next_header);
+        size_t padding_len = (block_size - (data_len % block_size)) % block_size;
+        
+        if (padding_len == 0) {
+            padding_len = block_size; // Всегда добавляем padding
+        }
+        
+        trailer.pad_length = static_cast<uint8_t>(padding_len);
+        trailer.next_header = next_header;
+        trailer.padding.resize(padding_len, ESP_DEFAULT_PAD);
+        trailer.padding.back() = ESP_PAD_NEXT; // Последний байт padding
+        
+        // 3. Объединяем payload и trailer
+        std::vector<uint8_t> to_encrypt;
+        to_encrypt.reserve(payload.size() + sizeof(trailer.pad_length) + 
+                          sizeof(trailer.next_header) + trailer.padding.size());
+        
+        to_encrypt.insert(to_encrypt.end(), payload.begin(), payload.end());
+        to_encrypt.push_back(trailer.pad_length);
+        to_encrypt.push_back(trailer.next_header);
+        to_encrypt.insert(to_encrypt.end(), trailer.padding.begin(), trailer.padding.end());
+        
+        // 4. Шифруем данные
+        std::vector<uint8_t> encrypted_data = cipher_->encrypt(to_encrypt, key, iv);
+        
+        // 5. Собираем полный ESP пакет
+        std::vector<uint8_t> esp_packet;
+        esp_packet.reserve(sizeof(header) + encrypted_data.size());
+        
+        // Конвертируем заголовок в сетевой порядок
+        header.to_network_order();
+        
+        // Добавляем заголовок
+        const uint8_t* header_ptr = reinterpret_cast<const uint8_t*>(&header);
+        esp_packet.insert(esp_packet.end(), header_ptr, header_ptr + sizeof(header));
+        
+        // Добавляем зашифрованные данные
+        esp_packet.insert(esp_packet.end(), encrypted_data.begin(), encrypted_data.end());
+        
+        // 6. Вычисляем и добавляем ICV (имитовставку)
+        std::vector<uint8_t> icv = auth_->compute(esp_packet, auth_key);
+        esp_packet.insert(esp_packet.end(), icv.begin(), icv.end());
+        
+        return esp_packet;
+    }
+    
+    // Декапсуляция ESP пакета
+    std::vector<uint8_t> decapsulate(
+        const std::vector<uint8_t>& esp_packet,
+        const std::vector<uint8_t>& key,
+        const std::vector<uint8_t>& auth_key,
+        uint8_t& next_header) {
+        
+        // 1. Проверяем минимальный размер пакета
+        if (esp_packet.size() < sizeof(EspHeader) + sizeof(EspTrailer) + auth_->digest_size()) {
+            throw std::runtime_error("Invalid ESP packet size");
+        }
+        
+        // 2. Проверяем ICV (имитовставку)
+        size_t icv_size = auth_->digest_size();
+        size_t packet_without_icv_size = esp_packet.size() - icv_size;
+        
+        std::vector<uint8_t> packet_without_icv(
+            esp_packet.begin(), 
+            esp_packet.begin() + packet_without_icv_size);
+            
+        std::vector<uint8_t> received_icv(
+            esp_packet.begin() + packet_without_icv_size, 
+            esp_packet.end());
+            
+        if (!auth_->verify(packet_without_icv, received_icv, auth_key)) {
+            throw std::runtime_error("ESP packet authentication failed");
+        }
+        
+        // 3. Парсим заголовок ESP
+        EspHeader header;
+        std::copy(esp_packet.begin(), esp_packet.begin() + sizeof(header), 
+                 reinterpret_cast<uint8_t*>(&header));
+        header.to_host_order();
+        
+        // 4. Получаем зашифрованные данные
+        size_t encrypted_data_size = packet_without_icv_size - sizeof(header);
+        std::vector<uint8_t> encrypted_data(
+            esp_packet.begin() + sizeof(header),
+            esp_packet.begin() + sizeof(header) + encrypted_data_size);
+            
+        // 5. Дешифруем данные
+        std::vector<uint8_t> iv(header.iv, header.iv + ESP_IV_LENGTH);
+        std::vector<uint8_t> decrypted_data = cipher_->decrypt(encrypted_data, key, iv);
+        
+        // 6. Парсим трейлер
+        if (decrypted_data.size() < 2) {
+            throw std::runtime_error("Invalid ESP decrypted data size");
+        }
+        
+        EspTrailer trailer;
+        trailer.pad_length = decrypted_data[decrypted_data.size() - 2];
+        trailer.next_header = decrypted_data[decrypted_data.size() - 1];
+        
+        // Проверяем длину padding
+        if (trailer.pad_length + 2 > decrypted_data.size()) {
+            throw std::runtime_error("Invalid ESP padding length");
+        }
+        
+        // Проверяем padding
+        size_t padding_start = decrypted_data.size() - trailer.pad_length - 2;
+        for (size_t i = 0; i < trailer.pad_length; ++i) {
+            uint8_t expected = (i == trailer.pad_length - 1) ? ESP_PAD_NEXT : ESP_DEFAULT_PAD;
+            if (decrypted_data[padding_start + i] != expected) {
+                throw std::runtime_error("Invalid ESP padding");
+            }
+        }
+        
+        // 7. Возвращаем payload
+        next_header = trailer.next_header;
+        return std::vector<uint8_t>(
+            decrypted_data.begin(),
+            decrypted_data.begin() + padding_start);
+    }
+    
+private:
+    // Генерация IV
+    void generate_iv(std::array<uint8_t, ESP_IV_LENGTH>& iv) {
+        // В реальной реализации используйте криптографически безопасный ГПСЧ
+        static std::random_device rd;
+        static std::mt19937 gen(rd());
+        static std::uniform_int_distribution<uint8_t> dis(0, 255);
+        
+        for (auto& byte : iv) {
+            byte = dis(gen);
+        }
+    }
+    
+    std::shared_ptr<MagmaCipher> cipher_;
+    std::shared_ptr<Imitovstavka> auth_;
+};
+
+// Класс для обработки IPSec ESP с использованием Boost.Asio
+class EspHandler {
+public:
+    EspHandler(boost::asio::io_context& io_context,
+              std::shared_ptr<EspProcessor> processor,
+              const std::string& local_address,
+              uint16_t local_port,
+              const std::string& remote_address,
+              uint16_t remote_port)
+        : socket_(io_context),
+          processor_(processor),
+          remote_endpoint_(
+              boost::asio::ip::make_address(remote_address),
+              remote_port) {
+              
+        boost::asio::ip::udp::endpoint local_ep(
+            boost::asio::ip::make_address(local_address),
+            local_port);
+            
+        socket_.open(local_ep.protocol());
+        socket_.bind(local_ep);
+        
+        start_receive();
+    }
+    
+    void send(const std::vector<uint8_t>& payload, uint8_t next_header) {
+        // В реальной реализации здесь должна быть логика выбора SPI и seq_num из SA
+        uint32_t spi = 0x12345678; // Пример SPI
+        static uint32_t seq_num = 0;
+        
+        // Ключи должны быть получены из IKEv2 SA
+        std::vector<uint8_t> enc_key(32, 0xAA); // Пример ключа шифрования
+        std::vector<uint8_t> auth_key(32, 0xBB); // Пример ключа аутентификации
+        
+        // Инкапсулируем пакет
+        std::vector<uint8_t> esp_packet = processor_->encapsulate(
+            payload, spi, ++seq_num, next_header, enc_key, auth_key);
+            
+        // Отправляем пакет
+        socket_.async_send_to(
+            boost::asio::buffer(esp_packet),
+            remote_endpoint_,
+            [](const boost::system::error_code& error, std::size_t bytes_transferred) {
+                if (error) {
+                    std::cerr << "Send error: " << error.message() << std::endl;
+                }
+            });
+    }
+    
+private:
+    void start_receive() {
+        socket_.async_receive_from(
+            boost::asio::buffer(recv_buffer_),
+            remote_endpoint_,
+            [this](const boost::system::error_code& error, std::size_t bytes_recvd) {
+                if (!error) {
+                    handle_receive(bytes_recvd);
+                } else {
+                    std::cerr << "Receive error: " << error.message() << std::endl;
+                }
+                start_receive();
+            });
+    }
+    
+    void handle_receive(std::size_t bytes_recvd) {
+        try {
+            // В реальной реализации ключи должны быть получены из SA по SPI
+            std::vector<uint8_t> enc_key(32, 0xAA); // Пример ключа шифрования
+            std::vector<uint8_t> auth_key(32, 0xBB); // Пример ключа аутентификации
+            
+            uint8_t next_header;
+            std::vector<uint8_t> packet_data(
+                recv_buffer_.begin(),
+                recv_buffer_.begin() + bytes_recvd);
+                
+            // Декапсулируем пакет
+            std::vector<uint8_t> payload = processor_->decapsulate(
+                packet_data, enc_key, auth_key, next_header);
+                
+            // Обрабатываем декодированный payload
+            std::cout << "Received payload size: " << payload.size() << std::endl;
+            std::cout << "Next header: " << static_cast<int>(next_header) << std::endl;
+            
+            // Здесь можно передать payload дальше по стеку
+        } catch (const std::exception& e) {
+            std::cerr << "ESP processing error: " << e.what() << std::endl;
+        }
+    }
+    
+    boost::asio::ip::udp::socket socket_;
+    std::shared_ptr<EspProcessor> processor_;
+    boost::asio::ip::udp::endpoint remote_endpoint_;
+    std::array<uint8_t, 65536> recv_buffer_;
+};
+
+} // namespace ipsec
